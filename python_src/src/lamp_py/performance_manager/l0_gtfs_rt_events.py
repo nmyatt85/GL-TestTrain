@@ -1,5 +1,6 @@
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Iterator
 
+import datetime
 import numpy
 import pandas
 import sqlalchemy as sa
@@ -26,7 +27,9 @@ from .l1_rt_trips import process_trips, load_new_trip_data
 from .l1_rt_metrics import update_metrics_from_temp_events
 
 
-def get_gtfs_rt_paths(db_manager: DatabaseManager) -> List[Dict[str, List]]:
+def get_gtfs_rt_paths(
+    db_manager: DatabaseManager, hours_to_process: int
+) -> Iterator[Tuple[datetime.datetime, Dict[str, List]]]:
     """
     get all of the gtfs_rt files and group them by the hour they are from.
     within a group, include the non bus route ids for the timestamp
@@ -66,9 +69,13 @@ def get_gtfs_rt_paths(db_manager: DatabaseManager) -> List[Dict[str, List]]:
     process_logger.add_metadata(hours_found=len(grouped_files))
     process_logger.log_complete()
 
-    return [
-        grouped_files[timestamp] for timestamp in sorted(grouped_files.keys())
-    ]
+    count = 0
+    for timestamp in sorted(grouped_files.keys()):
+        if count > hours_to_process:
+            return
+
+        yield timestamp, grouped_files[timestamp]
+        count += 1
 
 
 def combine_events(
@@ -429,7 +436,9 @@ def update_events_from_temp(db_manager: DatabaseManager) -> None:
     process_logger.log_complete()
 
 
-def process_gtfs_rt_files(db_manager: DatabaseManager) -> None:
+def process_gtfs_rt_files(
+    db_manager: DatabaseManager,
+) -> List[datetime.datetime]:
     """
     process vehicle position and trip update gtfs_rt files
 
@@ -451,16 +460,19 @@ def process_gtfs_rt_files(db_manager: DatabaseManager) -> None:
     processed upon success. if a failure happens in processing, the failure
     will be logged and the file will be marked with a process_fail in the
     MetadataLog table.
+
+    once completed, return the datetime of the last group of files that were processed.
     """
-    hours_to_process = 6
     process_logger = ProcessLogger("l0_gtfs_rt_tables_loader")
     process_logger.log_start()
 
-    for files in get_gtfs_rt_paths(db_manager):
+    timestamps: List[datetime.datetime] = []
+    hours_to_process = 6
+
+    for last_timestamp, files in get_gtfs_rt_paths(
+        db_manager, hours_to_process=hours_to_process
+    ):
         check_for_sigterm()
-        if hours_to_process == 0:
-            break
-        hours_to_process -= 1
 
         subprocess_logger = ProcessLogger(
             "l0_gtfs_rt_table_loader",
@@ -522,11 +534,14 @@ def process_gtfs_rt_files(db_manager: DatabaseManager) -> None:
                     # update event metrics columns
                     update_metrics_from_temp_events(db_manager)
 
+                    timestamps.append(last_timestamp)
+
             db_manager.execute(
                 sa.update(MetadataLog.__table__)
                 .where(MetadataLog.pk_id.in_(files["ids"]))
                 .values(processed=1)
             )
+
             subprocess_logger.add_metadata(event_count=events.shape[0])
             subprocess_logger.log_complete()
         except Exception as error:
@@ -538,3 +553,4 @@ def process_gtfs_rt_files(db_manager: DatabaseManager) -> None:
             subprocess_logger.log_failure(error)
 
     process_logger.log_complete()
+    return timestamps

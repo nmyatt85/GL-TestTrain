@@ -1,3 +1,4 @@
+import datetime
 from typing import Optional, List, Union
 
 import numpy
@@ -226,3 +227,19 @@ def rail_routes_from_filepath(
     )
 
     return [row[0] for row in result]
+
+
+def get_service_date_from_timestamp(
+    timestamp: datetime.datetime,
+) -> datetime.date:
+    """
+    Get the service date for a given timestamp. The MBTA service pauses between
+    night service and morning service the next day. A continuous block of
+    service all falls on the same service day, even though it covers two actual
+    days. Get the service date of a timestamp.
+    """
+    service_threshold_time = datetime.time(hour=5)
+    if timestamp.time() < service_threshold_time:
+        return timestamp.date() - datetime.timedelta(days=1)
+
+    return timestamp.date()

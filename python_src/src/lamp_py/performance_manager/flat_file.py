@@ -1,12 +1,44 @@
+import datetime
+import os
+from typing import List
+
 import sqlalchemy as sa
 import pyarrow
 
+from lamp_py.aws.s3 import write_parquet_file
+from lamp_py.performance_manager.gtfs_utils import (
+    get_service_date_from_timestamp,
+)
 from lamp_py.postgres.postgres_schema import (
     VehicleEvents,
     VehicleTrips,
     StaticStopTimes,
 )
 from lamp_py.postgres.postgres_utils import DatabaseManager
+
+
+def write_flat_files(
+    db_manager: DatabaseManager, dates: List[datetime.datetime]
+) -> None:
+    """write flat files to s3 for datetimes"""
+    dates_to_write = {get_service_date_from_timestamp(d) for d in dates}
+
+    for date in dates_to_write:
+        service_date = int(f"{date.year:4}{date.month:2}{date.day:2}")
+        flat_table = generate_daily_table(db_manager, service_date)
+
+        s3_directory = os.path.join(
+            os.environ["ARCHIVE_BUCKET"], "lamp", "flat_file"
+        )
+        filename = f"{date.isoformat()}-rail-performance.parquet"
+
+        write_parquet_file(
+            table=flat_table,
+            file_type="flat_rail_performance",
+            s3_dir=s3_directory,
+            partition_cols=["year", "month", "day"],
+            basename_template=filename,
+        )
 
 
 def generate_daily_table(
