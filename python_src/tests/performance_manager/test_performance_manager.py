@@ -211,6 +211,7 @@ def flat_table_check(db_manager: DatabaseManager, service_date: int) -> None:
         "year",
         "month",
         "day",
+        "service_date"
     ]
 
     for key in must_have_keys:
@@ -365,9 +366,11 @@ def test_gtfs_rt_processing(
     ]
     db_manager.add_metadata_paths(paths)
 
-    grouped_files = get_gtfs_rt_paths(db_manager)
+    last_timestamp = 0
 
-    for files in grouped_files:
+    for timestamp, files in get_gtfs_rt_paths(db_manager, hours_to_process=6):
+        assert timestamp > last_timestamp
+
         for path in files["vp_paths"]:
             assert "RT_VEHICLE_POSITIONS" in path
 
