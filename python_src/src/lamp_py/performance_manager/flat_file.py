@@ -7,12 +7,14 @@ import pyarrow
 
 from lamp_py.aws.s3 import write_parquet_file
 from lamp_py.performance_manager.gtfs_utils import (
+    static_version_key_from_service_date,
     get_service_date_from_timestamp,
 )
 from lamp_py.postgres.postgres_schema import (
     VehicleEvents,
     VehicleTrips,
     StaticStopTimes,
+    StaticStops,
 )
 from lamp_py.postgres.postgres_utils import DatabaseManager
 
@@ -47,6 +49,45 @@ def generate_daily_table(
     """
     Generate a dataframe of all events and metrics for a single service date
     """
+    static_version_key = static_version_key_from_service_date(
+        service_date=service_date, db_manager=db_manager
+    )
+
+    static_subquery = (
+        sa.select(
+            StaticStopTimes.arrival_time.label("scheduled_arrival_time"),
+            StaticStopTimes.departure_time.label("scheduled_departure_time"),
+            StaticStopTimes.schedule_travel_time_seconds.label(
+                "scheduled_travel_time"
+            ),
+            StaticStopTimes.schedule_headway_branch_seconds.label(
+                "scheduled_headway_branch"
+            ),
+            StaticStopTimes.schedule_headway_trunk_seconds.label(
+                "scheduled_headway_trunk"
+            ),
+            StaticStopTimes.trip_id,
+            sa.func.coalesce(
+                StaticStops.parent_station,
+                StaticStops.stop_id,
+            ).label("parent_station"),
+        )
+        .select_from(StaticStopTimes)
+        .join(
+            StaticStops,
+            sa.and_(
+                StaticStopTimes.static_version_key
+                == StaticStops.static_version_key,
+                StaticStopTimes.stop_id == StaticStops.stop_id,
+            ),
+        )
+        .where(
+            StaticStopTimes.static_version_key == static_version_key,
+            StaticStops.static_version_key == static_version_key,
+        )
+        .subquery(name="static_subquery")
+    )
+
     query = (
         sa.select(
             VehicleEvents.stop_sequence,
@@ -61,7 +102,7 @@ def generate_daily_table(
             VehicleEvents.dwell_time_seconds,
             VehicleEvents.headway_trunk_seconds,
             VehicleEvents.headway_branch_seconds,
-            VehicleTrips.service_date,
+            VehicleEvents.service_date,
             VehicleTrips.route_id,
             VehicleTrips.direction_id,
             VehicleTrips.start_time,
@@ -74,37 +115,27 @@ def generate_daily_table(
             VehicleTrips.vehicle_consist,
             VehicleTrips.direction,
             VehicleTrips.direction_destination,
-            VehicleTrips.static_start_time,
-            StaticStopTimes.arrival_time.label("scheduled_arrival_time"),
-            StaticStopTimes.departure_time.label("scheduled_departure_time"),
-            StaticStopTimes.schedule_travel_time_seconds.label(
-                "scheduled_travel_time"
-            ),
-            StaticStopTimes.schedule_headway_branch_seconds.label(
-                "scheduled_headway_branch"
-            ),
-            StaticStopTimes.schedule_headway_trunk_seconds.label(
-                "scheduled_headway_trunk"
-            ),
+            static_subquery.c.scheduled_arrival_time,
+            static_subquery.c.scheduled_departure_time,
+            static_subquery.c.scheduled_travel_time,
+            static_subquery.c.scheduled_headway_branch,
+            static_subquery.c.scheduled_headway_trunk,
         )
         .join(VehicleTrips, VehicleEvents.pm_trip_id == VehicleTrips.pm_trip_id)
         .join(
-            StaticStopTimes,
+            static_subquery,
             sa.and_(
-                StaticStopTimes.static_version_key
-                == VehicleTrips.static_version_key,
-                StaticStopTimes.trip_id == VehicleTrips.static_trip_id_guess,
-                StaticStopTimes.stop_id == VehicleEvents.stop_id,
+                static_subquery.c.trip_id == VehicleTrips.static_trip_id_guess,
+                static_subquery.c.parent_station
+                == VehicleEvents.parent_station,
             ),
             isouter=True,
         )
         .where(
-            sa.and_(
-                VehicleEvents.service_date == service_date,
-                sa.or_(
-                    VehicleEvents.vp_move_timestamp.is_not(None),
-                    VehicleEvents.vp_stop_timestamp.is_not(None),
-                ),
+            VehicleEvents.service_date == service_date,
+            sa.or_(
+                VehicleEvents.vp_move_timestamp.is_not(None),
+                VehicleEvents.vp_stop_timestamp.is_not(None),
             )
         )
     )
@@ -113,16 +144,15 @@ def generate_daily_table(
     days_events = db_manager.select_as_dataframe(query)
 
     # transform the seru
-    days_events["year"] = days_events.apply(
-        lambda record: int(str(record["service_date"])[0:4]), axis=1
+    days_events["year"] = (
+        days_events["service_date"].astype(str).str[:4].astype(int)
     )
-    days_events["month"] = days_events.apply(
-        lambda record: int(str(record["service_date"])[4:6]), axis=1
+    days_events["month"] = (
+        days_events["service_date"].astype(str).str[4:6].astype(int)
     )
-    days_events["day"] = days_events.apply(
-        lambda record: int(str(record["service_date"])[6:8]), axis=1
+    days_events["day"] = (
+        days_events["service_date"].astype(str).str[6:8].astype(int)
     )
-    days_events.drop(columns="service_date")
 
     flat_schema = pyarrow.schema(
         [
@@ -135,6 +165,7 @@ def generate_daily_table(
             ("dwell_time_seconds", pyarrow.int64()),
             ("headway_trunk_seconds", pyarrow.int64()),
             ("headway_branch_seconds", pyarrow.int64()),
+            ("service_date", pyarrow.int64()),
             ("route_id", pyarrow.string()),
             ("direction_id", pyarrow.int8()),
             ("start_time", pyarrow.int64()),
@@ -147,7 +178,6 @@ def generate_daily_table(
             ("vehicle_consist", pyarrow.string()),
             ("direction", pyarrow.string()),
             ("direction_destination", pyarrow.string()),
-            ("static_start_time", pyarrow.int64()),
             ("scheduled_arrival_time", pyarrow.int64()),
             ("scheduled_departure_time", pyarrow.int64()),
             ("scheduled_travel_time", pyarrow.int64()),
