@@ -93,7 +93,7 @@ Performance Manager is an application to measure rail performance on the MBTA tr
 | route_type | small integer | false | |
 | route_sort_order | integer | false | |
 | route_fare_class | string | false | |
-| line_id | string | true | |
+| line_id | string | tjkkk/rue | |
 | static_version_key | integer | false | key used to link GTFS static schedule versions between tables |
 
 ### `static_stops`
@@ -179,7 +179,7 @@ The CTD [Delta](https://github.com/mbta/delta) application is responsible for re
 
 The LAMP [Ingestion](../ingestion/README.md) application aggregates gzipped GTFS-RT update files, saved on S3 by Delta, into partitioned parquet files that are also saved to an S3 bucket. The parquet files are partitioned by GTFS-RT feed type and grouped into hourly chunks.
 
-The Performance Manager application reads the GTFS-RT partitioned parquet files for the Vehicle Positions and Trip Updates feeds and passes them through an aggregation and manipulation pipeline before inserting them into the [vehicle_events](#vehicle_events), [vehicle_trips](#vehicle_trips), and [vehicle_event_metrics](#vehicle_event_metrics) table schemas described above.
+The Performance Manager application reads the GTFS-RT partitioned parquet files for the Vehicle Positions and Trip Updates feeds and passes them through an aggregation and manipulation pipeline before inserting them into the [vehicle_events](#vehicle_events) and [vehicle_trips](#vehicle_trips) table schemas described above.
 
 When reading the GTFS-RT parquet files, records related to BUS data are removed to reduce database table sizes and processing time.
 
@@ -214,7 +214,7 @@ For calculations/metrics that require a vehicle stop timestamp, Performance Mana
 ### Travel Times 
 Travel times represent the amount of time a vehicle spent moving to the current station, from the previous station. 
 
-Travel times are saved as `travel_time_seconds` in the [vehicle_event_metrics](#vehicle_event_metrics) table:
+Travel times are saved as `travel_time_seconds` in the [vehicle_events](#vehicle_events) table:
 
 ```
 t_stop = coalesce(vp_stop_timestamp, tu_stop_timestamp)
@@ -227,7 +227,7 @@ Any `travel_time_seconds` calculated as a negative value is not saved.
 ### Dwell Times 
 Dwell times represent the amount of time a vehicle spent waiting at a station. A dwell time is not calculated for the last stop of a trip. The dwell time for the first stop of a trip is the duration since the previous vehicle trip stopped moving (including station turnaround time).
 
-Dwell times are saved as `dwell_time_seconds` in the [vehicle_event_metrics](#vehicle_event_metrics) table:
+Dwell times are saved as `dwell_time_seconds` in the [vehicle_events](#vehicle_events) table:
 
 ```sh
 # for first stop of trip
@@ -247,7 +247,7 @@ Any `dwell_time_seconds` calculated as a negative value is not saved.
 
 Headways represent the platform wait time a rider would experience on a route. This is a "departure-to-departure" calculation,  equivalent to the duration between a vehicle leaving a `parent_station` and the previous vehicle on the route leaving the same `parent_station` in the same direction. The first stop at a `parent_station` for each `service_date` will not have a calculated headway.
 
-Headways are calculated for `branch_route_id` and `trunk_route_id` designations and saved as `headway_branch_seconds` and `headway_trunk_seconds`, respectively, in the [vehicle_event_metrics](#vehicle_event_metrics) table:
+Headways are calculated for `branch_route_id` and `trunk_route_id` designations and saved as `headway_branch_seconds` and `headway_trunk_seconds`, respectively, in the [vehicle_events](#vehicle_events) table:
 
 ```sh
 t_station_depart = vp_move_timestamp # for next vehicle move event i.e. current station departure
@@ -282,6 +282,54 @@ For each GTFS Static schedule the following metrics are pre-calculated and store
 * scheduled_headway_branch_seconds
 
 The business logic of these calculations follows the same rules as the GTFS-RT metrics, except that headway metrics are partitioned by `parent_station`, `service_id`, `direction_id` and `trunk/branch_route_id`. 
+
+
+# Daily Flat File Schema and Generation
+
+## File Overview
+
+For each service date processed, the performance manager generates a flat parquet file and makes it publicly available. The flat file serves as a structured snapshot of data extracted from the Rail Performance Manager database. It enables efficient data exchange between different systems, reporting, and analysis.
+
+The extracted data is a join of realtime data from the [vehicle_events](#vehicle_events) and [vehicle_trips](#vehicle_trips) tables and static schedule data from the [static_stop_times](#static_stop_times) table.
+
+The performance manager loads new realtime data on an hourly basis. Whenever new data has been processed and corresponding flat files are either written or updated.
+
+## File Structure
+
+The flat files are saved as parquet files that are partitioned by year, month, and day on the service date. Service dates are defined as the date at the start of a continuous block of service. Trips occuring after midnight and before suspension of service have the previous days service date. At the end of each partitioned filepath, there is a single flat file named `<iso_date_format for service date>-rail-performance.parquet`. This file uses the following schema:
+
+| column name | data type | description | source table |
+| ----------- | --------- | ----------- | ------------ |
+| service_date | int64 | the service date formatted `<YYYYMMDD>` for this trip | [vehicle_events](#vehicle_events) |
+| start_time | int64 | when this trip started as seconds past midnight | [vehicle_trips](#vehicle_trips) |
+| route_id | string | the name of the route | [vehicle_trips](#vehicle_trips) |
+| branch_route_id | string | branch id for Red Line and Green Line | [vehicle_trips](#vehicle_trips) |
+| trunk_route_id | string | trunk id stripping branch identifiers from route id for Green Line | [vehicle_trips](#vehicle_trips) |
+| trip_id | string | trip id corresponding to the static GTFS schedule | [vehicle_trips](#vehicle_trips) |
+| direction_id | int8 | binary value noting direction. for | [vehicle_trips](#vehicle_trips) |
+| direction | string | human readable text corresponding to a direction | [vehicle_trips](#vehicle_trips) |
+| direction_destination | string | customer facing direction name, i.e. `Ashmont` / `Braintree` | [vehicle_trips](#vehicle_trips) |
+| stop_count | int16 | number of stops on this trip | [vehicle_trips](#vehicle_trips) |
+| | | | |
+| vehicle_id | string | vehicle id of the lead car on this train | [vehicle_trips](#vehicle_trips) |
+| vehicle_label | string | | [vehicle_trips](#vehicle_trips) |
+| vehicle_consist | string | | [vehicle_trips](#vehicle_trips) |
+| | | | |
+| stop_id | string | the stop id for this event | [vehicle_events](#vehicle_events) |
+| parent_station | string | the name of the station for this event | [vehicle_events](#vehicle_events) |
+| stop_sequence | int16 | where in the stop sequence of this route this stop occurs | [vehicle_events](#vehicle_events) |
+| | | | |
+| scheduled_departure_time | int64 | time this vehicle is scheduled to depart this station | [static_stop_times](#static_stop_times) |
+| move_timestamp | int64 | earliest moving status timestamp from GTFS-RT Vehicle Positions | [vehicle_events](#vehicle_events) |
+| scheduled_arrival_time | int64 | time this vehicle is scheduled to arrive at this station | [static_stop_times](#static_stop_times) |
+| stop_timestamp | int64 | earliest stop status timestamp from GTFS-RT Vehicle Positions or last timestamp found from GTFS-RT Trip Updates event, defaulting to Vehicle Positions if it exists | [vehicle_events](#vehicle_events) |
+| scheduled_travel_time | int64 | expected time for the vehicle to travel to this station | [static_stop_times](#static_stop_times) |
+| travel_time_seconds | int64 | seconds the vehicle spends traveling to this station | [vehicle_events](#vehicle_events) |
+| dwell_time_seconds | int64 | seconds the vehicle spends waiting at this station | [vehicle_events](#vehicle_events) |
+| scheduled_headway_trunk | int64 | shceduled departure to departure, `parent_station` wait time for vehicles traveling on `trunk_route_id` | [static_stop_times](#static_stop_times) |
+| headway_trunk_seconds | int64 | actual departure to departure, `parent_station` wait time for vehicles traveling on `trunk_route_id` | [vehicle_events](#vehicle_events) |
+| scheduled_headway_branch | int64 | scheduled departure to departure, `parent_station` wait time for vehicles traveling on `branch_route_id` | [static_stop_times](#static_stop_times) |
+| headway_branch_seconds | int64 | actual departure to departure, `parent_station` wait time for vehicles traveling on `branch_route_id` | [vehicle_events](#vehicle_events) |
 
 
 # Developer Usage
