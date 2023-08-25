@@ -218,6 +218,83 @@ def update_static_version_key(db_manager: DatabaseManager) -> None:
     process_logger.log_complete()
 
 
+def update_start_times(db_manager: DatabaseManager) -> None:
+    """
+    Add in start times to trips that do not have one. For scheduled trips,
+    look these up in the static schedule by finding the earliest Stop Time for
+    that trip id. Added trips cannot be found in the static schedule, so use
+    the earliest vehicle position information we have about them.
+    """
+    missing_start_times = (
+        sa.select(TempEventCompare.pm_trip_id)
+        .distinct()
+        .where(TempEventCompare.start_time.is_(None), TempEventCompare.new_trip)
+        .subquery("missing_start_times_sub")
+    )
+
+    scheduled_start_times = (
+        sa.select(
+            VehicleTrips.pm_trip_id,
+            sa.func.min(StaticStopTimes.departure_time).label(
+                "static_start_time"
+            ),
+        )
+        .join(
+            missing_start_times,
+            missing_start_times.c.pm_trip_id == VehicleTrips.pm_trip_id,
+        )
+        .join(
+            StaticStopTimes,
+            VehicleTrips.trip_id == StaticStopTimes.trip_id,
+            VehicleTrips.static_version_key
+            == StaticStopTimes.static_version_key,
+        )
+        .group_by(
+            VehicleTrips.pm_trip_id,
+            VehicleTrips.start_time,
+        )
+        .subquery("scheduled_start_times")
+    )
+
+    static_start_times_update_query = (
+        sa.update(VehicleTrips.__table__)
+        .where(
+            VehicleTrips.pm_trip_id == scheduled_start_times.c.pm_trip_id,
+        )
+        .values(
+            start_time=scheduled_start_times.c.static_start_time,
+        )
+    )
+
+    db_manager.execute(static_start_times_update_query)
+
+    unscheduled_start_times = (
+        sa.select(
+            TempEventCompare.pm_trip_id,
+            sa.func.min(TempEventCompare.vp_move_timestamp).label(
+                "rt_start_time"
+            ),
+        )
+        .where(TempEventCompare.start_time.is_(None), TempEventCompare.new_trip)
+        .group_by(
+            TempEventCompare.pm_trip_id,
+        )
+        .subquery("unscheduled_start_times")
+    )
+
+    rt_start_times_update_query = (
+        sa.update(VehicleTrips.__table__)
+        .where(
+            VehicleTrips.pm_trip_id == unscheduled_start_times.c.pm_trip_id,
+        )
+        .values(
+            start_time=unscheduled_start_times.c.rt_start_time,
+        )
+    )
+
+    db_manager.execute(rt_start_times_update_query)
+
+
 def update_trip_stop_counts(db_manager: DatabaseManager) -> None:
     """
     Update "stop_count" field for trips with new events
@@ -632,6 +709,7 @@ def process_trips(db_manager: DatabaseManager) -> None:
 
     """
     update_static_version_key(db_manager)
+    update_start_times(db_manager)
     update_trip_stop_counts(db_manager)
     update_prev_next_trip_stop(db_manager)
     update_static_trip_id_guess_exact(db_manager)
